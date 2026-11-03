@@ -1,0 +1,379 @@
+import os, subprocess, readline
+from typing import Literal
+
+from .types_shell import InputShell, OutputShell
+from .config import (
+    BUILTINS_COMMANDS,
+    COMPLETES,
+    SYSTEM_PATHS,
+    STDOUT,
+    STDERR,
+    PIPE,
+    JOB,
+    HIST_SIZE_LAST_ADD,
+    VARIABLES,
+)
+from .utils import (
+    find_path_command,
+    input_shell,
+    pipe_execution,
+)
+from .jobs import *
+from .history import append_history
+
+# Dicionário de comandos
+COMMANDS_MAP = dict()
+
+BUILTINS_COMMANDS.add('exit')
+
+
+def register_command(function):
+    """Decorator para registrar os comandos do shell"""
+    global BUILTINS_COMMANDS
+    COMMANDS_MAP[function.__name__[2:]] = function
+    BUILTINS_COMMANDS.add(function.__name__[2:])
+    return function
+
+
+@register_command
+def f_echo(input: InputShell) -> OutputShell:
+    """Implementa comando echo."""
+    return OutputShell(bytes((' '.join(input.args) + '\n'), 'utf-8')) 
+
+
+@register_command
+def f_type(input: InputShell) -> OutputShell:
+    """Implementa comando type - mostra tipo do comando."""
+    output = b''
+
+    for arg in input.args:
+        found = False
+        output += bytes(f'{arg}', 'utf-8')
+
+        if arg in get_builtins_commands():
+            found = True
+            output += bytes(' is a shell builtin\n', 'utf-8')
+        else:
+            path_command = find_path_command(SYSTEM_PATHS, arg)
+            if path_command and os.path.exists(path_command) and os.access(path_command, os.X_OK):
+                found = True
+                output += bytes(f' is {path_command}\n', 'utf-8')
+        if not found:
+            output += bytes(': not found\n', 'utf-8')
+    return OutputShell(output)
+
+
+@register_command
+def f_pwd(input: InputShell | None = None) -> OutputShell:
+    """Implementa comando pwd - mostra diretório atual."""
+    return OutputShell(bytes(os.getcwd() + '\n', 'utf-8'))
+
+
+@register_command
+def f_cd(input: InputShell) -> OutputShell:
+    """Implementa comando cd - muda diretório."""
+    if input.args:
+        path = input.args[0]
+        if '~' == path and (home := os.getenv('HOME')):
+            os.chdir(home)
+        elif os.path.exists(path):
+            os.chdir(path)
+        else:
+            return OutputShell(stderr=bytes(f'cd: {path}: No such file or directory\n', 'utf-8'))
+    return OutputShell()
+
+
+def _get_arg(args: list[str] | None, index: int=0) -> None | str:
+    try:
+        return args[index] if args else None
+    except IndexError:
+        return None
+
+
+def _read_file(filename: str | None) -> list[str] | Literal['']:
+    if filename is None: return ''
+    try:
+        with open(filename) as fn:
+            data = fn.read()
+    except FileNotFoundError:
+        return ''
+    data = data.split('\n')
+    data.pop()
+    return data
+
+
+def _read_history(args: list[str] | None) -> OutputShell:
+    filename = _get_arg(args, 1)
+    if not filename: return OutputShell()
+
+    data = _read_file(filename)
+    if not data: return OutputShell()
+
+    for d in data:
+        readline.add_history(d)
+    
+    append_history(len(data))
+    return OutputShell()
+
+
+def _read_rl():
+    hist_len = readline.get_current_history_length()
+    data = []
+    for index in range(1, hist_len+1):
+        data.append(readline.get_history_item(index))
+    
+    return data
+
+
+def _write_history(args: list[str] | None) -> OutputShell:
+    filename = _get_arg(args, 1)
+    if not filename: return OutputShell()
+
+    readline.write_history_file(filename)
+    return OutputShell()
+
+
+def add_history(args: list[str] | None) -> OutputShell:
+    filename = _get_arg(args, 1)
+    if not filename: return OutputShell()
+    hist_len = readline.get_current_history_length()
+    global HIST_SIZE_LAST_ADD
+
+    if not os.path.isfile(filename):
+        open(filename, 'w').close()
+
+    if HIST_SIZE_LAST_ADD == 0:
+        append_history(hist_len, filename)
+    else:
+        append_history(hist_len - HIST_SIZE_LAST_ADD, filename)
+    HIST_SIZE_LAST_ADD = hist_len
+
+    return OutputShell()
+
+
+@register_command
+def f_history(input: InputShell) -> OutputShell:
+    """Implementa comando history (placeholder)."""
+    data = ''
+    ind = number = 0
+
+    def enumerate_history(h: str) -> str:
+        nonlocal number
+        number += 1
+        return f'    {number}  {h}'
+
+    arg = _get_arg(input.args)
+    match arg:
+        case '-r':
+            return _read_history(input.args)
+        case '-w':
+            return _write_history(input.args)
+        case '-a':
+            return add_history(input.args)
+        case _:
+            if data := _read_rl():
+                data = list(map(enumerate_history, data))
+            if arg:
+                if not arg.isnumeric():
+                    return OutputShell()
+                ind = int(arg) * -1
+                ind = 0 if abs(ind) > len(data) else ind
+            data = '\n'.join(data[ind:]) + '\n'
+    return OutputShell(bytes(data, encoding='utf-8'))
+
+
+@register_command
+def f_jobs(input: InputShell) -> OutputShell:
+    """Implementa comando jobs."""
+
+    return jobs(input)
+
+
+def _register_complete(input: InputShell) -> None:
+    """Registra uma nova especificação de completação."""
+    cmd_spec = input.args[2]
+    args = f"complete -C '{input.args[1]}' {input.args[2]}"
+    COMPLETES[cmd_spec] = (args, input.args[1])
+
+
+def _get_info_complete(cmd: str | None) -> bytes:
+    """Obtém a especificação de completação para um comando, se existir."""
+    if cmd is None: return b''
+    if cmd in COMPLETES:
+        return bytes(COMPLETES[cmd][0] + '\n', encoding='utf-8')
+    return b''
+
+
+def _unregister_complete(cmd: str | None) -> None:
+    """Remove a especificação de completação para um comando, se existir."""
+    if cmd is None or cmd not in COMPLETES: return
+    COMPLETES.pop(cmd, None)
+
+
+@register_command
+def f_complete(input: InputShell) -> OutputShell:
+    """Implementa comando complete."""
+
+    if input.args is None or len(input.args) < 2:
+        return OutputShell()
+    
+    flag = _get_arg(input.args)
+    stderr = stdout = b''
+    match flag:
+        case '-p': # registrar novo complete para um comando
+            stdout = _get_info_complete(_get_arg(input.args, 1))
+            if stdout == b'':
+                stderr = bytes(f'complete: {_get_arg(input.args, 1)}: no completion specification\n', encoding='utf-8')
+        case '-C': # registrar nova especificação de completação
+            _register_complete(input)
+        case '-r': # remover especificação de completação
+            _unregister_complete(_get_arg(input.args, 1))
+    
+    return OutputShell(stdout=stdout, stderr=stderr)
+
+
+def _is_valid_var_name(name: str) -> bool:
+    """Verifica se um nome de variável é válido."""
+    if name[0].isdigit():
+        return False
+    for c in name[1:]:
+        if not (c.isalnum() or c == '_'):
+            return False
+    return True
+
+
+@register_command
+def f_declare(input: InputShell) -> OutputShell:
+    """Implementa comando declare - mostra variáveis do shell."""
+    if input.args is None or len(input.args) == 0:
+        return OutputShell()
+    
+    flag = _get_arg(input.args)
+    stdout = stderr = b''
+    match flag:
+        case '-p': # mostrar a descrição de uma variável do shell
+            var_name = _get_arg(input.args, 1)
+            if var_name in VARIABLES:
+                stdout = bytes(f'declare -- {var_name}="{VARIABLES[var_name]}"\n', encoding='utf-8')
+            else:
+                stderr = bytes(f'declare: {input.args[1]}: not found\n', encoding='utf-8')
+        case _ if flag and flag.find('=') != -1: # declarar nova variável do shell
+            var_name, var_value = flag.split('=', 1)
+            if _is_valid_var_name(var_name):
+                VARIABLES[var_name] = var_value
+            else:
+                stderr = bytes(f"declare: `{var_name}={var_value}': not a valid identifier\n", encoding='utf-8')
+                
+    return OutputShell(stdout=stdout, stderr=stderr)
+
+
+def external_command(input: InputShell) -> OutputShell:
+    """Executa comando externo."""
+    command = input.command
+    if input.args:
+        command = [command] + input.args
+    result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True)
+    return OutputShell(result.stdout, result.stderr, result.returncode)
+
+
+def command_handler(input: InputShell):
+    """
+    Resolve e retorna a função de comando apropriada.
+    
+    Args:
+        input: Estrutura com informações do comando
+        
+    Returns:
+        Função do comando ou None se não encontrado
+    """
+    if input.command == '':
+        return None
+    
+    append_history()
+
+    if input.command == 'exit':
+        exit()
+
+    command = COMMANDS_MAP.get(input.command)
+    if command is None and find_path_command(SYSTEM_PATHS, input.command):
+        command = external_command
+    
+    return command
+
+
+def get_builtins_commands() -> set:
+    return BUILTINS_COMMANDS
+
+
+def get_commands_map() -> dict:
+    return COMMANDS_MAP
+
+
+def execute(shell: InputShell):
+    if (exec_command := command_handler(shell)) is None:
+        return OutputShell(
+            stdout=b'',
+            stderr=bytes(f'{shell.command}: command not found\n', encoding='utf-8'),
+            returncode=127
+        )
+    return exec_command(shell)
+
+
+def execute_line(redirect, sh):
+    if not sh or sh[0].command == '': return OutputShell()
+    if redirect is not None:
+        return OutputShell(
+        stderr=bytes('shell: pipes, redirecionamentos e jobs não são suportados nesta versão remota\n', encoding='utf-8'),
+    )
+
+    return execute(sh[0])
+
+
+def run() -> None:
+    """Loop principal do shell."""
+
+    while True:
+        if output := check_bg_jobs():
+            print(output.stdout.decode(), end='', flush=True)
+        try:
+            input_sh = input_shell()
+        except KeyboardInterrupt:
+            break
+        else:
+            _redirect, _sh = input_sh
+            if _sh[0].command == '':
+                continue
+        
+        if _redirect == JOB:
+            output = run_bg_job(_sh[0])
+
+            print(output.stdout.decode(), output.stderr.decode(), flush=True)
+        elif _redirect == PIPE:
+            pipe_execution(_sh, COMMANDS_MAP, command_handler)
+        elif _redirect in (STDOUT, STDERR):
+            if (exec_command := command_handler(_sh[0])) is None:
+                print(f'{_sh[0].command}: command not found')
+                continue
+
+            output: OutputShell = exec_command(_sh[0])
+
+            with open(_sh[0].file_name, _sh[0].opening_mode, encoding='utf-8') as file:
+                to_redirect = output.stderr if _redirect == STDERR else output.stdout
+                file.write(to_redirect.decode())
+
+            if _redirect == STDERR:
+                print(output.stdout.decode(), end='')
+            else:
+                print(output.stderr.decode(), end='')
+        else:
+            output: OutputShell = execute(_sh[0])
+            print((output.stdout + output.stderr).decode(), end='', flush=True)
+
+
+__all__ = [
+    'run',
+    'execute_line'
+    'command_handler',
+    'get_commands_map',
+    'get_builtins_commands',
+]
